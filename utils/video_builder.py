@@ -1,10 +1,9 @@
-# utils/video_builder.py
-# — Clean, PIL-based text rendering; no ImageMagick; no moviepy.resize —
+# utils/video_builder.py — PIL text; no ImageMagick; no moviepy.resize
 import os, uuid, textwrap
 from typing import List, Tuple
 import numpy as np
 
-# --- Pillow 10+ compatibility shim (ANTIALIAS/BICUBIC/BILINEAR removed) ---
+# --- Pillow 10+ compatibility shim (removed constants) ---
 from PIL import Image
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
@@ -12,7 +11,7 @@ if not hasattr(Image, "BICUBIC"):
     Image.BICUBIC = Image.Resampling.BICUBIC
 if not hasattr(Image, "BILINEAR"):
     Image.BILINEAR = Image.Resampling.BILINEAR
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 from PIL import ImageDraw, ImageFont
 from moviepy.editor import (
@@ -38,70 +37,46 @@ def _gradient_bg(size: Tuple[int,int], seed: int = 0):
     bot = np.array([8, 8, 12], dtype=np.float32)
     ys = np.linspace(0, 1, h).reshape(-1, 1)
     grad = (top * (1 - ys) + bot * ys).astype(np.uint8)
-    img = np.repeat(grad, w, axis=1)
-    return img
+    return np.repeat(grad, w, axis=1)
 
 def _solid_bg(size: Tuple[int,int]):
     w, h = size
     color = np.array([12, 12, 16], dtype=np.uint8)
     return np.tile(color, (h, w, 1))
 
-def _render_text_image(text: str, size: Tuple[int,int], margin: int = 60) -> np.ndarray:
-    """Create a centered multiline text image with Pillow (no ImageMagick)."""
+def _render_text_image(text: str, size: Tuple[int,int]) -> np.ndarray:
     w, h = size
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
-    # Try a common font; fallback to Pillow default if not present.
     try:
         font = ImageFont.truetype("arial.ttf", 78)
     except Exception:
         font = ImageFont.load_default()
 
-    wrapped = _wrap_lines(text, max_chars=36)
-    lines = wrapped.split("\n")
+    lines = _wrap_lines(text, max_chars=36).split("\n")
+    boxes = [draw.textbbox((0, 0), ln, font=font) for ln in lines]
+    sizes = [(bx[2]-bx[0], bx[3]-bx[1]) for bx in boxes]
+    max_w = max([sw for sw, _ in sizes] + [0])
+    total_h = sum([sh for _, sh in sizes]) + max(0, len(lines)-1)*12
 
-    # Measure lines
-    line_boxes = [draw.textbbox((0, 0), ln, font=font) for ln in lines]
-    line_sizes = [(bx[2] - bx[0], bx[3] - bx[1]) for bx in line_boxes]
-    max_line_w = max((w for w, _ in line_sizes), default=0)
-    total_h = sum((h for _, h in line_sizes)) + max(0, len(lines) - 1) * 12
+    x = (w - max_w)//2
+    y = (h - total_h)//2
+    for ln, (_, sh) in zip(lines, sizes):
+        draw.text((x+2, y+2), ln, fill=(0,0,0,180), font=font, align="center")
+        draw.text((x, y), ln, fill=(255,255,255,255), font=font, align="center")
+        y += sh + 12
 
-    # Start positions (center)
-    x = (w - max_line_w) // 2
-    y = (h - total_h) // 2
-
-    # Draw with subtle shadow for readability
-    for (ln, (lw, lh)) in zip(lines, line_sizes):
-        # shadow
-        draw.text((x + 2, y + 2), ln, fill=(0, 0, 0, 180), font=font, align="center")
-        # main
-        draw.text((x, y), ln, fill=(255, 255, 255, 255), font=font, align="center")
-        y += lh + 12
-
-    # Return RGB for MoviePy
     return np.array(img.convert("RGB"))
 
 def _make_scene(text: str, audio_path: str, size: Tuple[int,int], style: str, seed: int):
-    # Background
-    if style == "solid":
-        bg_img = _solid_bg(size)
-    else:
-        bg_img = _gradient_bg(size, seed)
-
+    bg_img = _solid_bg(size) if style == "solid" else _gradient_bg(size, seed)
     bg = ImageClip(bg_img).set_duration(AudioFileClip(audio_path).duration)
+    caption = ImageClip(_render_text_image(text, size)).set_duration(bg.duration)
 
-    # Caption (as an image)
-    caption_img = _render_text_image(text, size=size)
-    caption = ImageClip(caption_img).set_duration(bg.duration)
-
-    # Voice track with gentle fade
     voice = AudioFileClip(audio_path)
     voice = audio_fadein(voice, 0.05).fx(audio_fadeout, 0.1)
 
-    # No Ken-Burns zoom (avoids ANTIALIAS path). Simple composite.
-    scene = CompositeVideoClip([bg, caption]).set_duration(voice.duration).set_audio(voice)
-    return scene
+    return CompositeVideoClip([bg, caption]).set_duration(voice.duration).set_audio(voice)
 
 def _make_srt(segments: List[Tuple[str, float]]) -> str:
     def fmt(ts: float) -> str:
@@ -120,74 +95,54 @@ def _make_srt(segments: List[Tuple[str, float]]) -> str:
 def build_video_from_script(script: str, out_dir: str, tts, style: str = "gradient",
                             target_seconds: int = 60, aspect: str = "vertical"):
     size = VIDEO_SIZES.get(aspect, VIDEO_SIZES["vertical"])
-
-    # Split script into scenes
     lines = [ln.strip() for ln in script.splitlines() if ln.strip()]
     if not lines:
         raise ValueError("Script has no non-empty lines.")
 
-    # TTS per line
     audio_files, durations, segments = [], [], []
     for idx, line in enumerate(lines):
         wav_path = os.path.join(out_dir, f"scene_{idx+1:02d}.wav")
         dur = tts.synth(line, wav_path)
-        audio_files.append(wav_path)
-        durations.append(dur)
-        segments.append((line, dur))
+        audio_files.append(wav_path); durations.append(dur); segments.append((line, dur))
 
-    # Trim to target length if needed
     total = sum(durations)
     if total > target_seconds:
-        new_lines, new_audio, new_durs = [], [], []
-        running = 0.0
+        new_lines, new_audio, new_durs, run = [], [], [], 0.0
         for ln, af, d in zip(lines, audio_files, durations):
-            if running + d <= target_seconds:
-                new_lines.append(ln); new_audio.append(af); new_durs.append(d)
-                running += d
+            if run + d <= target_seconds:
+                new_lines.append(ln); new_audio.append(af); new_durs.append(d); run += d
             else:
-                remaining = max(0.3, target_seconds - running)
+                remaining = max(0.3, target_seconds - run)
                 new_lines.append(ln + " …"); new_audio.append(af); new_durs.append(remaining)
                 break
         lines, audio_files, durations = new_lines, new_audio, new_durs
 
-    # Build scenes
     clips = []
     for i, (ln, af, d) in enumerate(zip(lines, audio_files, durations)):
-        scene = _make_scene(ln, af, size=size, style=style, seed=1234 + i)
-        if scene.duration > d:
-            scene = scene.set_duration(d)
+        scene = _make_scene(ln, af, size=size, style=style, seed=1234+i)
+        if scene.duration > d: scene = scene.set_duration(d)
         clips.append(scene)
 
-    # Concatenate
     video = concatenate_videoclips(clips, method="compose")
 
-    # Outputs
-    basename = str(uuid.uuid4())[:8]
-    video_out = os.path.join(out_dir, f"{basename}.mp4")
-    srt_out = os.path.join(out_dir, f"{basename}.srt")
-    audio_mix_out = os.path.join(out_dir, f"{basename}.wav")
+    base = str(uuid.uuid4())[:8]
+    video_out = os.path.join(out_dir, f"{base}.mp4")
+    srt_out   = os.path.join(out_dir, f"{base}.srt")
+    audio_out = os.path.join(out_dir, f"{base}.wav")
 
-    # Write video
-    video.write_videofile(
-        video_out, fps=30, codec="libx264", audio_codec="aac",
-        threads=4, verbose=False, logger=None
-    )
-
-    # Export audio track if present
+    video.write_videofile(video_out, fps=30, codec="libx264", audio_codec="aac",
+                          threads=4, verbose=False, logger=None)
     try:
         if video.audio is not None:
-            video.audio.write_audiofile(audio_mix_out, fps=44100, nbytes=2, logger=None)
+            video.audio.write_audiofile(audio_out, fps=44100, nbytes=2, logger=None)
         else:
-            audio_mix_out = None
+            audio_out = None
     except Exception:
-        audio_mix_out = None
+        audio_out = None
 
-    # Subtitles
     with open(srt_out, "w", encoding="utf-8") as f:
         f.write(_make_srt(segments))
 
-    # Cleanup
     for c in clips: c.close()
     video.close()
-
-    return video_out, srt_out, audio_mix_out
+    return video_out, srt_out, audio_out
