@@ -21,7 +21,7 @@ form.addEventListener("submit", async (e) => {
       result.classList.remove("d-none");
       addLink("🎬 MP4 Video", res.data.video_url);
       if (res.data.srt_url) addLink("💬 Subtitles (.srt)", res.data.srt_url);
-      if (res.data.audio_url) addLink("🎙️ Voice‑Over (.wav)", res.data.audio_url);
+      if (res.data.audio_url) addLink("🎙️ Voice-Over (.wav)", res.data.audio_url);
     } else {
       alert(res.data.error || "Failed to generate video.");
     }
